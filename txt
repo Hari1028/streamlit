@@ -1,0 +1,92 @@
+Okay so what I and my lead has decide that as that this POC is something like in the screen we have two part one is the chatbot interface where the user will interact with the chatbot and tell it which table he wants the graph so the LLM has the strcture of graphs in graphs.py so it will ask the user which graph to show then it will make the graph and show in the right side of the Screen, dude just think of how Grafana looks and work just like that we have to build this , and also if we run the app.py file and in the database if one more table add at that time it should be able to make the graph of that table if user said this is what the grafana also do 
+
+
+
+
+This is a perfect summary of the requirement. You are building a Conversational Observability Platform—essentially, a "Talking Grafana."
+
+Let's break down exactly how we achieve this architecture logically so you can explain it to your lead. We need to solve three specific challenges to make this work: The Dynamic Discovery, The Template Matching, and The Consultative Loop.
+
+1. The Dynamic Discovery (Handling "New Tables" Automatically)
+You asked: "If one more table is added, it should be able to make the graph of that table."
+
+This is the most "Grafana-like" feature. In Grafana, you don't rewrite code when you add a table; you just query it.
+
+How we do it:
+
+Your get_schema_context() function in app.py is the key.
+
+Currently, it runs once at startup. We need to ensure that every time the user sends a message, we inject the latest schema state into the prompt.
+
+The Flow:
+
+User: "Visualize the new silver_sales table."
+
+System: Runs SELECT name FROM sqlite_master → Finds silver_sales exists.
+
+System: Fetches columns (date, revenue).
+
+System: Updates the System Prompt with this new metadata.
+
+Result: The LLM now "knows" the table exists without you changing a single line of code.
+
+2. The Template Matching (The "Bridge" between Chat and Graph)
+The LLM needs to know what "tools" (graphs) are available in your graph.py so it can offer them to the user.
+
+The Logic:
+
+We don't just dump the code into the prompt. We give the LLM a "Menu" of the functions available in graph.py.
+
+The Menu Prompt:
+
+"You have access to a Graph Library with these 4 Templates:
+
+Line Chart: Requires a Date column + a Numeric column. Good for trends.
+
+Bar Chart: Requires a Category column + a Numeric column. Good for comparisons.
+
+Scatter Plot: Requires 2 Numeric columns. Good for correlations.
+
+Histogram: Requires 1 Numeric column. Good for distributions."
+
+The "Consultation" (Agent Logic):
+
+When the user asks for bronze_customers, the Agent looks at the columns: customer_id (text), customer_city (category), customer_state (category).
+
+The Agent checks the Menu: "I can't do a Scatter plot (not enough numbers). I can't do a Line chart (no dates). But I can do a Bar Chart of City counts."
+
+This logic allows the Agent to filter out "bad graphs" before even asking the user.
+
+3. The Interaction Flow (The "Split Screen" Experience)
+This is the user experience (UX) part. We need to move from "Command-Response" to "Conversation."
+
+The Conversation Script (How it feels):
+
+Phase 1: Discovery
+
+User: "Hi, can you help me check the bronze_orders table?"
+
+Agent (Chatbox): "Hello! I see the bronze_orders table has timestamps and order statuses. Would you like to visualize the volume trend?" (Note: It didn't draw anything yet).
+
+Phase 2: Negotiation
+
+User: "Yes, show me the trend."
+
+Agent (Chatbox): "I can use the Line Chart template for that. Do you want to group it by Day or Hour?"
+
+User: "By Day."
+
+Phase 3: Execution (The Grafana Moment)
+
+Agent (Chatbox): "Plotting Daily Order Volume now." (Agent sends the hidden CMD_PLOT signal).
+
+Right Screen: The Graph canvas updates instantly with the Line Chart.
+
+4. Why this impresses your Lead
+Zero-Touch Maintenance: You prove that if Data Engineering adds 50 new tables tomorrow, this Dashboard works immediately because the Agent reads the schema dynamically.
+
+Safety: The Agent doesn't try to plot a "Scatter Plot" on text data (which would crash the app). It only offers templates that fit the data types.
+
+The "Grafana" Feel: It separates the Query (Left side) from the Result (Right side), which is exactly how professional BI tools work.
+
+Shall we update the app.py code to implement this "Consultative Prompt" and Dynamic Schema injection?
