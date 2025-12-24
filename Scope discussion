@@ -1,0 +1,179 @@
+📋 POC Scope: AI-Driven Anomaly Co-Pilot
+1. The Objective
+To build a "Headless" Data Observability agent that allows non-technical users to detect, investigate, and visualize data anomalies using natural language, without writing SQL or Python.
+
+2. The Architecture (The "Sidecar" Pattern)
+We are not building a full data pipeline. We are building a monitoring sidecar that sits next to the database.
+
+Layer 1: The Chaos Engine (Data Generation)
+
+Goal: Simulate real-world failures on demand.
+
+Scope: Python scripts (etl/) that read clean data and inject specific errors into "Bronze" tables.
+
+Scenarios:
+
+Volume Spike: 50x traffic increase (Simulates DDoS/Bots).
+
+Volume Drop: 99% data loss (Simulates pipeline failure).
+
+Data Quality: Null injections & Duplicates.
+
+Schema/Logic: "Fat Finger" price errors ($1M products).
+
+Layer 2: The Police (Detection)
+
+Goal: Catch the chaos automatically.
+
+Scope: A Python detector (anomaly/detector.py) that scans Bronze tables against a rule set (rules.py).
+
+Output: Writes findings to a persistent log table (anomaly_audit_log).
+
+Layer 3: The Investigator (The App)
+
+Goal: Explain the problem to the human.
+
+Scope: A Streamlit Chat interface powered by an LLM (GPT-4o-mini).
+
+Core capabilities:
+
+Text-to-SQL (Implicit): User asks "Check orders", LLM queries schema.
+
+Text-to-Chart: User asks "Show trend", LLM generates Plotly Line Charts.
+
+Text-to-Graph: User asks "What is connected to this?", LLM generates Graphviz Lineage maps.
+
+3. Functional Requirements (User Journey)
+The POC is "Complete" when a user can perform this specific loop:
+
+Inject: Run python trigger.py --scenario spike.
+
+Alert: Open the App. The Chatbot acknowledges the new table or anomaly.
+
+Investigate (Structure):
+
+User: "How does this table connect to customers?"
+
+System: Renders a Network Graph showing the relationship and highlighting the infected table in Red.
+
+Investigate (Metrics):
+
+User: "Show me the volume trend."
+
+System: Renders a Line Chart showing the spike.
+
+Root Cause:
+
+User: "Is this normal?"
+
+System: LLM analyzes the data/audit log and replies: "No, this is a Critical Anomaly detected at 10:00 AM."
+
+
+
+Feature,In Scope (We Build This),Out of Scope (We Ignore This)
+Data Source,Local SQLite (olist.sqlite),connecting to Snowflake/Databricks/AWS
+Latency,Batch processing (User clicks run),Real-time Streaming (Kafka)
+Auth,Single User (Admin),Multi-user Login / RBAC
+Visualization,Static Charts & Graphs,Interactive Drill-down / Zooming
+Fixing,Detection Only,Auto-healing / Writing back to DB
+
+5. Success Criteria (The "Done" Checklist)
+We can close the project when we can demonstrate:
+
+[ ] The Brain: The Chatbot correctly interprets "Show me anomalies" vs "Show me the graph".
+
+[ ] The Eyes: The anomaly_audit_log correctly captures 100% of injected errors.
+
+[ ] The Hands: The Graphviz engine renders a white-background flowchart without crashing.
+
+[ ] The Resilience: The app does not crash if a table is empty or missing.
+
+=============================================================================
+The scope seems to be fine just I am putting my points so that you go through that and tell me whether all these points are covered or not in this
+
+1. The user ask the LLM and it will generate the graph of the table ,we have the strcuture of graph with us just the content will pass and graph will be generated
+
+2. when the streamlit is running and in the database at the same time we get a new table that also we are able to built the graph if user say
+
+3. We are able do the graphviz relation
+
+4. the anomalies should be visible if we have founc i
+
+==============================
+1. User asks LLM -> Graph Generated
+Status: ✅ Covered.
+
+How: Your system_prompt contains the Graphviz templates. The LLM takes the user's intent ("How do these connect?") and fills the template with the table names. The app.py renders it.
+
+2. Dynamic New Tables (Real-time updates)
+Status: ✅ Covered.
+
+How: This works because of how Streamlit works.
+
+Every time you hit "Enter" in the chat, the entire script re-runs.
+
+Your function get_schema_context() executes a fresh SQL query: SELECT name FROM sqlite_master.
+
+If a new table was added 1 second ago, this query catches it, feeds it to the LLM, and the LLM says "Oh, I see a new table." No restart required.
+
+3. Graphviz Relationships
+Status: ✅ Covered.
+
+How: We implemented the logic to parse CMD_GRAPH, strip the markdown, and render the white-background graph.
+
+4. Anomalies should be visible in the Graph (The Red Node)
+Status: ⚠️ Partially Covered (Needs Data Connection).
+
+The Gap: currently, the LLM knows how to make a node red (color=red), but it doesn't know WHICH table to color red because it isn't reading the anomaly_audit_log.
+
+The Fix: We need to update get_schema_context to peek at the anomaly_audit_log table. If it sees an error for bronze_orders, it should tell the LLM "Warning: bronze_orders has an active anomaly."
+
+
+def get_schema_context():
+    if not os.path.exists(DB_PATH):
+        return "NO DATABASE FOUND"
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    
+    # 1. Get List of Tables
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = cur.fetchall()
+
+    # 2. Get List of Anomalies (The Police Report)
+    # We check which tables have recent critical anomalies
+    anomalous_tables = []
+    try:
+        cur.execute("SELECT DISTINCT source_table FROM anomaly_audit_log WHERE severity='CRITICAL'")
+        anomalous_tables = [row[0] for row in cur.fetchall()]
+    except:
+        pass # Table might not exist yet
+
+    schema = "DATABASE SCHEMA:\n"
+    for t in tables:
+        table_name = t[0]
+        
+        # 3. TAG THE ANOMALY
+        # If this table is in the 'Bad List', we explicitly tell the LLM!
+        status_tag = " [⚠️ HAS ANOMALY]" if table_name in anomalous_tables else ""
+        
+        try:
+            cur.execute(f"PRAGMA table_info({table_name})")
+            cols = [f"{c[1]} ({c[2]})" for c in cur.fetchall()]
+            schema += f"- {table_name}{status_tag}: {', '.join(cols)}\n"
+        except:
+            pass
+
+    conn.close()
+    return schema
+
+Why this fixes Point #4:
+Now, the system_prompt that the LLM reads will look like this:
+
+customers: id (int), name (text)
+
+bronze_orders [⚠️ HAS ANOMALY]: id (int), status (text)
+
+Because the prompt explicitly says "HAS ANOMALY", the LLM (which has the instruction Use red color for Bronze/Anomaly tables) will automatically color that node RED in the graph without you having to ask for it.
+
+4. Technical Boundaries (What is IN vs OUT)
