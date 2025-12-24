@@ -1,0 +1,316 @@
+import streamlit as st
+import pandas as pd
+import sqlite3
+import os
+import requests
+import shutil
+from dotenv import load_dotenv
+import time
+
+# ===================== IMPORT GRAPH FACTORY =====================
+try:
+    from graphs import graph_factory
+except ImportError:
+    st.error("❌ Error: 'graphs.py' not found. Please make sure graphs.py is in the same directory.")
+    st.stop()
+
+# ===================== SETUP =====================
+load_dotenv()
+st.set_page_config(page_title="Anomaly Co-Pilot", layout="wide")
+
+DB_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "olist.sqlite"
+)
+
+# ===================== STYLING (GRAFANA DARK MODE) =====================
+st.markdown("""
+<style>
+.stApp { background-color: #0E1117; }
+/* Chat Bubbles */
+.stChatMessage {
+    background-color: #161B22;
+    border: 1px solid #30363D;
+    border-radius: 10px;
+    padding: 10px;
+}
+/* Fixed Right Canvas */
+div[data-testid="stVerticalBlock"] > div:has(div.stPlotlyChart) {
+    border: 1px solid #333;
+    border-radius: 10px;
+    padding: 20px;
+    background-color: #161B22;
+    min-height: 500px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ===================== LLM CONNECTION =====================
+def query_llm(messages):
+    token = os.environ.get("LLMFOUNDRY_TOKEN")
+    if not token:
+        return "ERROR: Missing LLM token"
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": messages,
+        "temperature": 0.2
+    }
+
+    headers = {
+        
+    }
+
+    # --- RETRY LOGIC (Try 3 times) ---
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(
+               
+                json=payload,
+                headers=headers,
+                timeout=30
+            )
+            r.raise_for_status() # Check for errors
+            return r.json()["choices"][0]["message"]["content"]
+            
+        except requests.exceptions.HTTPError as e:
+            # If error is 429 (Too Many Requests), wait and try again
+            if e.response.status_code == 429:
+                wait_time = (attempt + 1) * 2 # Wait 2s, then 4s, then 6s
+                time.sleep(wait_time)
+                continue # Try again
+            else:
+                return f"LLM ERROR: {e}"
+        except Exception as e:
+            return f"LLM ERROR: {e}"
+
+    return "ERROR: System is busy. Please try again in a minute."
+# ===================== DB HELPERS =====================
+def get_schema_context():
+    if not os.path.exists(DB_PATH):
+        return "NO DATABASE FOUND"
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = cur.fetchall()
+
+    schema = "DATABASE SCHEMA:\n"
+    for t in tables:
+        try:
+            cur.execute(f"PRAGMA table_info({t[0]})")
+            cols = [f"{c[1]} ({c[2]})" for c in cur.fetchall()]
+            schema += f"- {t[0]}: {', '.join(cols)}\n"
+        except:
+            pass
+
+    conn.close()
+    return schema
+
+def get_data_for_graph(table):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        return pd.read_sql(f"SELECT * FROM {table} LIMIT 2000", conn)
+    except:
+        return None
+    finally:
+        conn.close()
+
+# ===================== SESSION STATE =====================
+if "messages" not in st.session_state:
+    st.session_state.messages = [{
+        "role": "assistant",
+        "content": "Hello! I am your Data Observability Agent. Ask me about tables or relationships."
+    }]
+
+if "last_cmd" not in st.session_state:
+    st.session_state.last_cmd = None
+
+# ===================== SYSTEM PROMPT =====================
+schema_context = get_schema_context()
+
+system_prompt = f"""
+You are a Data Observability Agent (Grafana-like).
+You have access to a SQLite database:
+{schema_context}
+
+You have access to 4 Plot Templates: 'line', 'bar', 'histogram', 'scatter'.
+
+PROTOCOL:
+1. PHASE 1: CONSULTATION
+   - If user asks to check a table, analyze columns first.
+   - Propose 2-3 suitable graphs.
+
+2. PHASE 2: EXECUTION (COMMANDS)
+   - Only output a command when user confirms.
+   - The command must be the LAST line.
+
+   OPTION A: STANDARD PLOTS
+   Format: `CMD_PLOT|table_name|graph_type`
+   Example: "Plotting data. CMD_PLOT|bronze_orders|line"
+
+   OPTION B: NETWORK GRAPHS (Relationships/Lineage)
+   Format: `CMD_GRAPH|digraph G {{ ... }}`
+   Rules:
+   - Use `rankdir=LR;`
+   - Use `node [shape=box];`
+   - Use `color=red` for anomalies.
+   Example: "Here is the lineage. CMD_GRAPH|digraph G {{ rankdir=LR; node [shape=box]; customers -> orders; }}"
+"""
+
+# ===================== UI LAYOUT =====================
+st.title("🤖 Anomaly Co-Pilot")
+col_chat, col_viz = st.columns([1, 1.4])
+
+# ===================== LEFT COLUMN: CHAT =====================
+with col_chat:
+    st.subheader("💬 Chat")
+
+    # Display History
+    for msg in st.session_state.messages:
+        if msg["role"] != "system":
+            with st.chat_message(msg["role"]):
+                # Clean display text (hide commands)
+                text = msg["content"]
+                if "CMD_PLOT" in text:
+                    text = text.split("CMD_PLOT")[0].strip()
+                elif "CMD_GRAPH" in text:
+                    text = text.split("CMD_GRAPH")[0].strip()
+                st.markdown(text)
+
+    # Input Handler
+    if user_input := st.chat_input("Ask something (e.g., 'Visualize bronze_orders')..."):
+        # 1. User Message
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        # 2. LLM Query
+        llm_messages = [{"role": "system", "content": system_prompt}] + st.session_state.messages[-10:]
+        
+        with st.spinner("Thinking..."):
+            response = query_llm(llm_messages)
+
+        # 3. Command Parsing logic
+        cmd_detected = False
+        
+        # --- CASE A: PLOT ---
+        if "CMD_PLOT|" in response:
+            try:
+                cmd_part = response.split("CMD_PLOT|")[1].strip()
+                table, g_type = cmd_part.split("|")
+                st.session_state.last_cmd = {
+                    "mode": "plot", 
+                    "table": table.strip(), 
+                    "type": g_type.strip()
+                }
+                cmd_detected = True
+            except:
+                st.error("Failed to parse Plot command.")
+
+        # --- CASE B: GRAPH ---
+        elif "CMD_GRAPH|" in response:
+            try:
+                # Extract DOT code
+                dot = response.split("CMD_GRAPH|", 1)[1].strip()
+                # Clean up markdown if LLM adds it
+                if "digraph" in dot:
+                    dot = "digraph" + dot.split("digraph", 1)[1]
+                    dot = dot.split("```")[0].strip()
+                
+                st.session_state.last_cmd = {
+                    "mode": "graph", 
+                    "code": dot
+                }
+                cmd_detected = True
+            except:
+                st.error("Failed to parse Graph command.")
+
+        # 4. Save Assistant Reply
+        st.session_state.messages.append({"role": "assistant", "content": response})
+        
+        # 5. Rerun to update Canvas
+        if cmd_detected:
+            st.rerun()
+        else:
+            # If just text, show it now
+            clean_resp = response.split("CMD_PLOT")[0].split("CMD_GRAPH")[0].strip()
+            with st.chat_message("assistant"):
+                st.markdown(clean_resp)
+
+# ===================== RIGHT COLUMN: VISUALIZATION =====================
+with col_viz:
+    st.subheader("📊 Visualization Canvas")
+
+    if st.session_state.last_cmd:
+        cmd = st.session_state.last_cmd
+
+        # ------------------ MODE 1: NETWORK GRAPH ------------------
+        if cmd["mode"] == "graph":
+            if not shutil.which("dot"):
+                st.error("⚠️ SYSTEM ERROR: Graphviz executable not found!")
+                st.info("Install Graphviz on your machine to see this graph.")
+            else:
+                # CSS INJECTION FOR WHITE BACKGROUND (The Fix!)
+                st.markdown("""
+                <style>
+                div[data-testid="stGraphvizChart"] svg {
+                    background-color: white;
+                    padding: 20px;
+                    border-radius: 10px;
+                }
+                </style>
+                """, unsafe_allow_html=True)
+
+                try:
+                    st.graphviz_chart(cmd["code"])
+                    st.success("Graph Rendered Successfully")
+                except Exception as e:
+                    st.error(f"Graphviz Error: {e}")
+                    st.code(cmd["code"])
+
+        # ------------------ MODE 2: STANDARD PLOT ------------------
+        elif cmd["mode"] == "plot":
+            table = cmd['table']
+            g_type = cmd['type']
+            
+            df = get_data_for_graph(table)
+            
+            if df is not None and not df.empty:
+                # Auto-Detect Columns
+                num_cols = df.select_dtypes(include=['number']).columns.tolist()
+                cat_cols = df.select_dtypes(include=['object']).columns.tolist()
+                date_cols = [c for c in df.columns if 'date' in c.lower() or 'time' in c.lower()]
+                
+                config = {'type': g_type, 'title': f"{g_type.title()} of {table}"}
+                
+                # Column Mapping Logic
+                if g_type == 'line':
+                    config['x'] = date_cols[0] if date_cols else df.columns[0]
+                    config['y'] = num_cols[0] if num_cols else df.columns[1]
+                elif g_type == 'bar':
+                    config['x'] = cat_cols[0] if cat_cols else df.columns[0]
+                    config['y'] = num_cols[0] if num_cols else df.columns[1]
+                elif g_type == 'histogram':
+                    config['x'] = num_cols[0] if num_cols else df.columns[0]
+                elif g_type == 'scatter':
+                    config['x'] = num_cols[0] if num_cols else df.columns[0]
+                    config['y'] = num_cols[1] if len(num_cols) > 1 else df.columns[1]
+
+                # Render
+                fig = graph_factory(df, config)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.success(f"Rendered {g_type} for {table}")
+                else:
+                    st.error("Could not render graph.")
+            else:
+                st.warning(f"Table '{table}' is empty or not found.")
+
+    else:
+        # Empty State
+        st.info("Ask the agent to visualize data or show relationships.")
